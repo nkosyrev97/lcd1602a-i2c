@@ -179,7 +179,6 @@ static int lcd1602a_poll_busy(struct lcd1602a_data *priv)
 }
 #endif
 
-#if 0
 static int lcd1602a_get_current_address(struct lcd1602a_data *priv)
 {
     int ret = lcd1602a_rcv_byte_common(priv, 0);
@@ -190,7 +189,6 @@ static int lcd1602a_get_current_address(struct lcd1602a_data *priv)
 
     return (ret & LCD_CURRENT_ADDR);
 }
-#endif
 
 static int lcd1602a_get_data_byte(struct lcd1602a_data *priv)
 {
@@ -270,13 +268,12 @@ static int lcd1602a_set_current_address(struct lcd1602a_data *priv, unsigned int
     int ret;
     u8 cmd = 0;
 
-    if (pos < DDRAM_ROW_LENGTH) {
+    if (pos <= DDRAM_ROW_LENGTH) {
         cmd |= CMD_SET_POS_1ROW_BASE + pos;
-    } else if ((pos >= DDRAM_ROW_LENGTH) && (pos < 2 * DDRAM_ROW_LENGTH)) {
-        cmd |= CMD_SET_POS_2ROW_BASE + (pos - DDRAM_ROW_LENGTH);
+    } else if ((pos > DDRAM_ROW_LENGTH) && (pos <= 2 * DDRAM_ROW_LENGTH + 1)) {
+        cmd |= CMD_SET_POS_2ROW_BASE + (pos - DDRAM_ROW_LENGTH - 1);
     } else {
-        ret = -EINVAL;
-        goto lcd_set_addr_err;
+        ret = -ENOSPC;
     }
 
     ret = lcd1602a_send_cmd(priv, cmd);
@@ -424,15 +421,50 @@ static irqreturn_t lcd1602a_threaded_isr(int irq, void *dev_id)
 }
 #endif
 
+static inline loff_t lcd1602_llseek(struct file *file, loff_t offset, int orig)
+{
+    return fixed_size_llseek(file, offset, orig, 2 * (DDRAM_ROW_LENGTH + 1));
+}
+
 static int lcd1602a_open(struct inode *inode, struct file *filp)
 {
+    int ret = -EFAULT;
     struct lcd1602a_data *priv = container_of(inode->i_cdev, struct lcd1602a_data, cdev);
 
     if (test_and_set_bit(LCD_OPENED_FLAG, &priv->state_flags))
         return -EBUSY;
 
     filp->private_data = priv;
-    return nonseekable_open(inode, filp);
+    filp->f_pos = 0;
+
+    mutex_lock(&priv->lock);
+
+    if (filp->f_flags & O_TRUNC) {
+        ret = lcd1602a_clear(priv);
+        if (ret)
+            goto open_err;
+    }
+
+    if (filp->f_flags & O_APPEND) {
+        ret = lcd1602a_get_current_address(priv);
+        if (ret < 0)
+            goto open_err;
+
+        if (ret >= DDRAM_1ROW_OFFSET &&
+            ret <= DDRAM_1ROW_OFFSET + DDRAM_ROW_LENGTH)
+            filp->f_pos = ret - DDRAM_1ROW_OFFSET;
+        else if (ret >= DDRAM_2ROW_OFFSET &&
+                 ret <= DDRAM_2ROW_OFFSET + DDRAM_ROW_LENGTH)
+            filp->f_pos = (ret - DDRAM_2ROW_OFFSET) + DDRAM_ROW_LENGTH + 1;
+        else
+            filp->f_pos = 2 * DDRAM_ROW_LENGTH + 2;
+    }
+
+    ret = 0;
+
+open_err:
+    mutex_unlock(&priv->lock);
+    return ret;
 }
 
 static int lcd1602a_release(struct inode *inode, struct file *filp)
@@ -450,9 +482,8 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
     struct lcd1602a_data *priv = filp->private_data;
 
     /* We are going to read by rows which have 17 chars. The 17th char is always '\n'. */
-    int total_size = DDRAM_ROW_LENGTH + 1;
-    loff_t relative_pos = *ppos % total_size;
-    loff_t dev_pos = *ppos;
+    int virt_row_size = DDRAM_ROW_LENGTH + 1;
+    loff_t relative_pos = *ppos % virt_row_size;
 
     if (!test_bit(LCD_POWERED_FLAG, &priv->state_flags))
         return -EIO;
@@ -463,11 +494,11 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
     }
 
     /* Handle zero count or EOF */
-    if (!count || (*ppos >= 2 * total_size))
+    if (!count || (*ppos >= 2 * virt_row_size))
         return 0;
 
-    if (count > total_size - relative_pos)
-        count = total_size - relative_pos;
+    if (count > virt_row_size - relative_pos)
+        count = virt_row_size - relative_pos;
 
     tmp = kzalloc(count * sizeof(*tmp), GFP_KERNEL);
     if (!tmp)
@@ -476,15 +507,14 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
     mutex_lock(&priv->lock);
 
     /* Sync cursor and file position */
-    if (*ppos > DDRAM_ROW_LENGTH)
-            dev_pos = *ppos - 1;
-    ret = lcd1602a_set_current_address(priv, dev_pos);
+    ret = lcd1602a_set_current_address(priv, *ppos);
     if (ret)
         goto read_err;
 
     for (i = 0; i < count; i++) {
         /* Check 'new line' position */
         if (relative_pos == DDRAM_ROW_LENGTH) {
+            lcd1602a_set_current_address(priv, DDRAM_ROW_LENGTH + 1);
             tmp[i] = '\n';
         } else {
             ret = lcd1602a_get_data_byte(priv);
@@ -523,10 +553,9 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
 
     /* We are going to write by rows which have 17 chars. The 17th char is always '\n'.
      * The received '\n' before 17th position will fill the rest of the row with spaces */
-    int total_size = DDRAM_ROW_LENGTH + 1;
-    loff_t relative_pos = *ppos % total_size;
-    loff_t dev_pos = *ppos;
-    int ppos_offset = 0;
+    int virt_row_size = DDRAM_ROW_LENGTH + 1;
+    loff_t output_pos = *ppos;
+    int relative_pos = output_pos % virt_row_size;
 
     if (!test_bit(LCD_POWERED_FLAG, &priv->state_flags))
         return -EIO;
@@ -537,13 +566,13 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
     }
 
     /* Handle EOF and zero count */
-    if (*ppos >= 2 * total_size)
+    if (*ppos > 2 * DDRAM_ROW_LENGTH)
         return -ENOSPC;
     if (!count)
         return 0;
 
-    if (count > total_size - relative_pos)
-        count = total_size - relative_pos;
+    if (count > 2 * DDRAM_ROW_LENGTH - *ppos)
+        count = 2 * DDRAM_ROW_LENGTH - *ppos + 1;
 
     tmp = kzalloc(count * sizeof(*tmp), GFP_KERNEL);
     if (!tmp)
@@ -554,45 +583,60 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
         return -EFAULT;
     }
 
+//    if (tmp[2 * DDRAM_ROW_LENGTH] != '\n')
+//        return -ENOSPC;
+
     mutex_lock(&priv->lock);
 
     /* Sync cursor and file position */
-    if (*ppos > DDRAM_ROW_LENGTH)
-            dev_pos = *ppos - 1;
-    ret = lcd1602a_set_current_address(priv, dev_pos);
+    ret = lcd1602a_set_current_address(priv, *ppos);
     if (ret)
         goto write_err;
 
     for (i = 0; i < count; i++) {
-        /* '\n' as 17th char in the row */
+        /* '\n' as 17th char in the row situation */
         if (relative_pos == DDRAM_ROW_LENGTH) {
-            ppos_offset++;
-            break;
+            output_pos++;
+            if (tmp[i] == '\n')
+                continue;
+            relative_pos = output_pos % virt_row_size;
+
+            /* Move cursor to the next row */
+            ret = lcd1602a_set_current_address(priv, *ppos + 1);
+            if (ret)
+                goto write_err;
         }
 
-        /* '\n' in the row before 17th char */
+        /* '\n' in the row before 17th char situation */
         if (tmp[i] == '\n') {
-            while (relative_pos != DDRAM_ROW_LENGTH) {
+            if (*ppos >= 2 * DDRAM_ROW_LENGTH)
+                break;
+
+            while (relative_pos < DDRAM_ROW_LENGTH) {
                 ret = lcd1602a_putchar(priv, ' ');
-                    if (ret)
-                        goto write_err;
-                relative_pos++;
-                ppos_offset++;
+                if (ret)
+                    goto write_err;
+
+                (*ppos)++;
+                output_pos++;
+                relative_pos = output_pos % virt_row_size;
             }
 
-            i++;
-            ppos_offset++;
-            break;
-        }
+            output_pos++;
+            ret = lcd1602a_set_current_address(priv, *ppos + 1);
+            if (ret)
+                goto write_err;
+        } else {
+            ret = lcd1602a_putchar(priv, tmp[i]);
+            if (ret)
+                goto write_err;
 
-        ret = lcd1602a_putchar(priv, tmp[i]);
-        if (ret)
-            goto write_err;
-        relative_pos++;
-        ppos_offset++;
+            (*ppos)++;
+            output_pos++;
+        }
+        relative_pos = output_pos % virt_row_size;
     }
 
-    *ppos += ppos_offset;
     ret = i;
 
 write_err:
@@ -603,7 +647,7 @@ write_err:
 
 static struct file_operations lcd1602a_fops = {
     .owner = THIS_MODULE,
-    .llseek = noop_llseek,
+    .llseek = lcd1602_llseek,
     .open = lcd1602a_open,
     .release = lcd1602a_release,
     .read = lcd1602a_read,
