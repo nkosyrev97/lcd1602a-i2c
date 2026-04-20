@@ -6,7 +6,6 @@
 #include "jh7110-pinfunc.h"
 
 &sysgpio {
-
 	lcd1602a_pins: lcd1602a-pins {
 		pinmux = <GPIOMUX(54, GPOUT_LOW, GPOEN_DISABLE, GPI_NONE)>;
 		bias-pull-up;

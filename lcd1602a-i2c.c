@@ -10,6 +10,7 @@
 #include <linux/delay.h>
 #include <linux/string.h>
 #include <linux/interrupt.h>
+#include <linux/gpio/consumer.h>
 
 #define LCD_MODULE_NAME                "lcd1602a-i2c"
 
@@ -96,7 +97,8 @@ struct lcd1602a_data
     struct i2c_client *client;
     struct cdev cdev;
     struct mutex lock;
-//    int irq;
+    int irq;
+    struct gpio_desc *btn;
 };
 
 static bool cursor_init;
@@ -412,12 +414,12 @@ lcd_exit_err:
     return ret;
 }
 
-#if 0
 static irqreturn_t lcd1602a_threaded_isr(int irq, void *dev_id)
 {
+    struct lcd1602a_data *priv = dev_id;
+    dev_info(priv->dev, "Hello from the ISR!\n");
     return IRQ_HANDLED;
 }
-#endif
 
 static inline loff_t lcd1602_llseek(struct file *file, loff_t offset, int orig)
 {
@@ -721,9 +723,10 @@ static DEVICE_ATTR(cursor, S_IWUSR | S_IRUGO, lcd1602a_cursor_show, lcd1602a_cur
 static int lcd1602a_probe(struct i2c_client *client)
 {
     int ret;
+    u32 debounce_ms;
     struct lcd1602a_data *priv;
 
-    if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_BYTE)) {
+    if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_BYTE | I2C_FUNC_SMBUS_BYTE_DATA)) {
         dev_err(&client->dev, "I2C_FUNC_SMBUS_BYTE is not supported by this adapter!\n");
         return -EIO;
     }
@@ -741,9 +744,30 @@ static int lcd1602a_probe(struct i2c_client *client)
 
     mutex_init(&priv->lock);
 
+    priv->btn = devm_gpiod_get(priv->dev, "button", GPIOD_IN);
+    if (IS_ERR(priv->btn))
+        return PTR_ERR(priv->btn);
+
+    if (!device_property_read_u32(priv->dev, "debounce-interval", &debounce_ms)) {
+        ret = gpiod_set_debounce(priv->btn, debounce_ms * 1000);
+        if (ret)
+            dev_warn(priv->dev, "Warning! Could not set debounce! (code = %d)\n", ret);
+    }
+
+    priv->irq = gpiod_to_irq(priv->btn);
+    if (priv->irq < 0)
+        return priv->irq;
+
+    ret = devm_request_threaded_irq(priv->dev, priv->irq, NULL, lcd1602a_threaded_isr,
+                                    IRQF_ONESHOT | IRQF_TRIGGER_FALLING, LCD_MODULE_NAME, priv);
+    if (ret) {
+        dev_err(priv->dev, "Error! Could request IRQ handler! (code = %d)\n", ret);
+        return ret;
+    }
+
     ret = register_chrdev_region(MKDEV(LCD_MAJOR, LCD_MINOR_BASE), LCD_MINOR_COUNT, LCD_MODULE_NAME);
     if (ret) {
-        dev_err(&client->dev, "Error! Could register major:minor numbers!\n");
+        dev_err(priv->dev, "Error! Could register major:minor numbers!\n");
         return ret;
     }
 
@@ -751,7 +775,7 @@ static int lcd1602a_probe(struct i2c_client *client)
     cdev_init(&priv->cdev, &lcd1602a_fops);
     ret = cdev_add(&priv->cdev, MKDEV(LCD_MAJOR, LCD_MINOR_BASE), LCD_MINOR_COUNT);
     if (ret) {
-        dev_err(&client->dev, "Error! Could register cdev object!\n");
+        dev_err(priv->dev, "Error! Could register cdev object!\n");
         goto probe_err1;
     }
 
