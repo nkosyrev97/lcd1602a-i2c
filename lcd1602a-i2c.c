@@ -20,6 +20,7 @@
 #define LCD_OPENED_FLAG                0
 #define LCD_POWERED_FLAG               1
 #define LCD_BACKLIGHT_FLAG             2
+#define LCD_CURSOR_FLAG                3
 
 /* PCF8574 GPIO pins to LCD1602A pins mapping */
 #define RS_PIN                         BIT(0) /* 0 = CMD, 1 = DATA */
@@ -74,7 +75,7 @@
 #define CMD_DISPLAY_SHIFT              (CMD_GP_ENTRY_MODE_SET | CMD_CURSOR_INCREMENT | CMD_SHIFT_DISPLAY)
 #define CMD_LCD_DISPLAY_OFF            CMD_GP_DISPLAY_ONOFF
 #define CMD_LCD_DISPLAY_PLAIN          (CMD_GP_DISPLAY_ONOFF | CMD_DISPLAY_ON)
-#define CMD_LCD_DISPLAY_CURSOR         (CMD_GP_DISPLAY_ONOFF | CMD_DISPLAY_ON | CMD_CURSOR_ON)
+#define CMD_LCD_DISPLAY_CURSOR         (CMD_GP_DISPLAY_ONOFF | CMD_DISPLAY_ON | CMD_CURSOR_BLINK_ON)
 #define CMD_4BIT_1ROW                  CMD_GP_FUNCTION_SET
 #define CMD_4BIT_2ROWS                 (CMD_GP_FUNCTION_SET | CMD_2ROWS_MODE)
 #define CMD_SET_POS_1ROW_BASE          (CMD_GP_SET_DDRAM_ADDR | DDRAM_1ROW_OFFSET)
@@ -97,6 +98,10 @@ struct lcd1602a_data
     struct mutex lock;
 //    int irq;
 };
+
+static bool cursor_init;
+module_param (cursor_init, bool, S_IRUGO);
+MODULE_PARM_DESC (cursor_init, "Enable line cursor during initialization");
 
 static void lcd1602a_error_recovery(struct lcd1602a_data *priv)
 {
@@ -308,6 +313,29 @@ lcd_bl_err:
     return ret;
 }
 
+static int lcd1602a_cursor_op(struct lcd1602a_data *priv, bool on)
+{
+    int ret;
+
+    if (on) {
+        ret = lcd1602a_send_cmd(priv, CMD_LCD_DISPLAY_CURSOR);
+        if (ret)
+            goto lcd_cursor_err;
+        set_bit(LCD_CURSOR_FLAG, &priv->state_flags);
+    } else {
+        ret = lcd1602a_send_cmd(priv, CMD_LCD_DISPLAY_PLAIN);
+        if (ret)
+            goto lcd_cursor_err;
+        clear_bit(LCD_CURSOR_FLAG, &priv->state_flags);
+    }
+
+    return ret;
+
+lcd_cursor_err:
+    dev_err(priv->dev, "Failed to show/hide LCD's cursor! (code = %d)\n", ret);
+    return ret;
+}
+
 static int lcd1602a_init(struct lcd1602a_data *priv)
 {
     /* Sync LCD and force to 4-bit mode by magic sequence */
@@ -340,7 +368,7 @@ static int lcd1602a_init(struct lcd1602a_data *priv)
     if (ret)
         goto lcd_init_err;
 
-    ret = lcd1602a_send_cmd(priv, CMD_LCD_DISPLAY_PLAIN);
+    ret = lcd1602a_cursor_op(priv, cursor_init);
     if (ret)
         goto lcd_init_err;
 
@@ -647,13 +675,48 @@ static ssize_t lcd1602a_backlight_store(struct device *dev, struct device_attrib
         return -EFAULT;
 
     mutex_lock(&priv->lock);
-    lcd1602a_backlight_op(priv, res);
+    if (lcd1602a_backlight_op(priv, res)) {
+        mutex_unlock(&priv->lock);
+        return -EFAULT;
+    }
+
+    mutex_unlock(&priv->lock);
+    return count;
+}
+
+static DEVICE_ATTR(backlight, S_IWUSR | S_IRUGO, lcd1602a_backlight_show, lcd1602a_backlight_store);
+
+static ssize_t lcd1602a_cursor_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    ssize_t count = 0;
+    struct lcd1602a_data *priv = dev_get_drvdata(dev);
+
+    mutex_lock(&priv->lock);
+    count = sysfs_emit(buf, "%d\n", test_bit(LCD_CURSOR_FLAG, &priv->state_flags));
     mutex_unlock(&priv->lock);
 
     return count;
 }
 
-static DEVICE_ATTR(backlight, S_IWUSR | S_IRUGO, lcd1602a_backlight_show, lcd1602a_backlight_store);
+static ssize_t lcd1602a_cursor_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    bool res;
+    struct lcd1602a_data *priv = dev_get_drvdata(dev);
+
+    if (kstrtobool(buf, &res))
+        return -EFAULT;
+
+    mutex_lock(&priv->lock);
+    if (lcd1602a_cursor_op(priv, res)) {
+        mutex_unlock(&priv->lock);
+        return -EFAULT;
+    }
+
+    mutex_unlock(&priv->lock);
+    return count;
+}
+
+static DEVICE_ATTR(cursor, S_IWUSR | S_IRUGO, lcd1602a_cursor_show, lcd1602a_cursor_store);
 
 static int lcd1602a_probe(struct i2c_client *client)
 {
@@ -692,6 +755,7 @@ static int lcd1602a_probe(struct i2c_client *client)
         goto probe_err1;
     }
 
+    device_create_file(priv->dev, &dev_attr_cursor);
     device_create_file(priv->dev, &dev_attr_backlight);
 
     ret = lcd1602a_init(priv);
@@ -716,6 +780,7 @@ static void lcd1602a_remove(struct i2c_client *client)
     lcd1602a_exit(priv);
 
     device_remove_file(priv->dev, &dev_attr_backlight);
+    device_remove_file(priv->dev, &dev_attr_cursor);
 
     cdev_del(&priv->cdev);
     unregister_chrdev_region(MKDEV(LCD_MAJOR, LCD_MINOR_BASE), LCD_MINOR_COUNT);
