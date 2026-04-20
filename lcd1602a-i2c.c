@@ -568,13 +568,13 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
     }
 
     /* Handle EOF and zero count */
-    if (*ppos > 2 * DDRAM_ROW_LENGTH)
+    if (*ppos >= 2 * virt_row_size - 1)
         return -ENOSPC;
     if (!count)
         return 0;
 
-    if (count > 2 * DDRAM_ROW_LENGTH - *ppos)
-        count = 2 * DDRAM_ROW_LENGTH - *ppos + 1;
+    if (count >= 2 * virt_row_size - 1 - *ppos)
+        count = 2 * virt_row_size - 1 - *ppos;
 
     tmp = kzalloc(count * sizeof(*tmp), GFP_KERNEL);
     if (!tmp)
@@ -584,9 +584,6 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
         kfree(tmp);
         return -EFAULT;
     }
-
-//    if (tmp[2 * DDRAM_ROW_LENGTH] != '\n')
-//        return -ENOSPC;
 
     mutex_lock(&priv->lock);
 
@@ -611,9 +608,6 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
 
         /* '\n' in the row before 17th char situation */
         if (tmp[i] == '\n') {
-            if (*ppos >= 2 * DDRAM_ROW_LENGTH)
-                break;
-
             while (relative_pos < DDRAM_ROW_LENGTH) {
                 ret = lcd1602a_putchar(priv, ' ');
                 if (ret)
