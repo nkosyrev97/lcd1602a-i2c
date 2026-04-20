@@ -483,7 +483,8 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
 
     /* We are going to read by rows which have 17 chars. The 17th char is always '\n'. */
     int virt_row_size = DDRAM_ROW_LENGTH + 1;
-    loff_t relative_pos = *ppos % virt_row_size;
+    loff_t output_pos = *ppos;
+    loff_t relative_pos = output_pos % virt_row_size;
 
     if (!test_bit(LCD_POWERED_FLAG, &priv->state_flags))
         return -EIO;
@@ -497,7 +498,7 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
     if (!count || (*ppos >= 2 * virt_row_size))
         return 0;
 
-    if (count > virt_row_size - relative_pos)
+    if (count >= virt_row_size - relative_pos)
         count = virt_row_size - relative_pos;
 
     tmp = kzalloc(count * sizeof(*tmp), GFP_KERNEL);
@@ -514,7 +515,7 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
     for (i = 0; i < count; i++) {
         /* Check 'new line' position */
         if (relative_pos == DDRAM_ROW_LENGTH) {
-            lcd1602a_set_current_address(priv, DDRAM_ROW_LENGTH + 1);
+            lcd1602a_set_current_address(priv, output_pos + 1);
             tmp[i] = '\n';
         } else {
             ret = lcd1602a_get_data_byte(priv);
@@ -523,7 +524,8 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
             tmp[i] = ret;
         }
 
-        relative_pos++;
+        output_pos++;
+        relative_pos = output_pos % virt_row_size;
     }
 
     mutex_unlock(&priv->lock);
@@ -531,7 +533,7 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
     if (copy_to_user(buf, tmp, count)) {
         ret = -EFAULT;
     } else {
-        *ppos += count;
+        *ppos += output_pos;
         ret = count;
     }
 
