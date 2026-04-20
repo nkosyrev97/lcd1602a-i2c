@@ -483,6 +483,7 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
         goto read_err;
 
     for (i = 0; i < count; i++) {
+
         /* Check 'new line' position */
         if (rel_virt_pos == DDRAM_ROW_LENGTH) {
             lcd1602a_set_current_address(priv, virt_pos + 1);
@@ -564,11 +565,6 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
         goto write_err;
 
     for (i = 0; i < count; i++) {
-        /* If very last char is '\n' - just swallow it and quit */
-        if (*ppos == max_virt_size - 1 && tmp[i] == '\n') {
-            i++;
-            break;
-        }
 
         /* '\n' as 17th char in the virtual row */
         if (rel_virt_pos == DDRAM_ROW_LENGTH) {
