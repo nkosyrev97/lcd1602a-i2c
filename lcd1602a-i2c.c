@@ -416,8 +416,34 @@ lcd_exit_err:
 
 static irqreturn_t lcd1602a_threaded_isr(int irq, void *dev_id)
 {
+    int ret = -EFAULT;
     struct lcd1602a_data *priv = dev_id;
-    dev_info(priv->dev, "Hello from the ISR!\n");
+
+    /* Debounce sleeping */
+    msleep(50);
+
+    mutex_lock(&priv->lock);
+
+    if (test_bit(LCD_POWERED_FLAG, &priv->state_flags)) {
+        ret = lcd1602a_send_cmd(priv, CMD_LCD_DISPLAY_OFF);
+        if (ret)
+            goto lcd_isr_err;
+        clear_bit(LCD_POWERED_FLAG, &priv->state_flags);
+    } else {
+        if (test_bit(LCD_CURSOR_FLAG, &priv->state_flags)) {
+            ret = lcd1602a_send_cmd(priv, CMD_LCD_DISPLAY_CURSOR);
+            if (ret)
+                goto lcd_isr_err;
+        } else {
+            ret = lcd1602a_send_cmd(priv, CMD_LCD_DISPLAY_PLAIN);
+            if (ret)
+                goto lcd_isr_err;
+        }
+        set_bit(LCD_POWERED_FLAG, &priv->state_flags);
+    }
+
+lcd_isr_err:
+    mutex_unlock(&priv->lock);
     return IRQ_HANDLED;
 }
 
@@ -430,6 +456,9 @@ static int lcd1602a_open(struct inode *inode, struct file *filp)
 {
     int ret = -EFAULT;
     struct lcd1602a_data *priv = container_of(inode->i_cdev, struct lcd1602a_data, cdev);
+
+    if (!test_bit(LCD_POWERED_FLAG, &priv->state_flags))
+        return -EIO;
 
     if (test_and_set_bit(LCD_OPENED_FLAG, &priv->state_flags))
         return -EBUSY;
