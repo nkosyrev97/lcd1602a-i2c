@@ -83,7 +83,7 @@
 /* Sleep periods */
 #define INIT_FIRST_SLEEP_MS            5
 #define INIT_SECOND_SLEEP_US_MIN       150
-#define INIT_SECORD_SLEEP_US_MAX       200
+#define INIT_SECOND_SLEEP_US_MAX       200
 #define CLEAR_SLEEP_MS                 2
 #define USUAL_SLEEP_US_MIN             50
 #define USUAL_SLEEP_US_MAX             100
@@ -321,7 +321,7 @@ static int lcd1602a_init(struct lcd1602a_data *priv)
     if (ret)
         goto lcd_init_err;
 
-    usleep_range(INIT_SECOND_SLEEP_US_MIN, INIT_SECORD_SLEEP_US_MAX);
+    usleep_range(INIT_SECOND_SLEEP_US_MIN, INIT_SECOND_SLEEP_US_MAX);
 
     ret = lcd1602a_write_nibble(priv, CMD_GP_FUNCTION_SET | CMD_8BIT_DATA_MODE, 0);
     if (ret)
@@ -468,7 +468,7 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
     if (!count || (*ppos >= 2 * virt_row_size))
         return 0;
 
-    if (count >= virt_row_size - rel_virt_pos)
+    if (count > virt_row_size - rel_virt_pos)
         count = virt_row_size - rel_virt_pos;
 
     tmp = kzalloc(count * sizeof(*tmp), GFP_KERNEL);
@@ -523,9 +523,10 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
     unsigned char *tmp = NULL;
     struct lcd1602a_data *priv = filp->private_data;
 
-    /* We are going to write by rows which have 17 chars. The 17th char is always '\n'.
-     * The received '\n' before 17th position will fill the rest of the row with spaces */
+    /* We are going to write by rows which have 17 chars. The 17th char is always '\n'. */
     int virt_row_size = DDRAM_ROW_LENGTH + 1;
+    /* 2 phys rows by 16 chars and 1 virtual '\n' between them */
+    int max_virt_size = 2 * virt_row_size - 1;
     loff_t virt_pos = *ppos;
     int rel_virt_pos = virt_pos % virt_row_size;
 
@@ -538,13 +539,13 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
     }
 
     /* Handle EOF and zero count */
-    if (*ppos >= 2 * virt_row_size - 1)
+    if (*ppos >= max_virt_size)
         return -ENOSPC;
     if (!count)
         return 0;
 
-    if (count >= 2 * virt_row_size - 1 - *ppos)
-        count = 2 * virt_row_size - 1 - *ppos;
+    if (count > max_virt_size - *ppos)
+        count = max_virt_size - *ppos;
 
     tmp = kzalloc(count * sizeof(*tmp), GFP_KERNEL);
     if (!tmp)
@@ -563,7 +564,13 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
         goto write_err;
 
     for (i = 0; i < count; i++) {
-        /* '\n' as 17th char in the row situation */
+        /* If very last char is '\n' - just swallow it and quit */
+        if (*ppos == max_virt_size - 1 && tmp[i] == '\n') {
+            i++;
+            break;
+        }
+
+        /* '\n' as 17th char in the virtual row */
         if (rel_virt_pos == DDRAM_ROW_LENGTH) {
             virt_pos++;
             if (tmp[i] == '\n')
@@ -576,7 +583,8 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
                 goto write_err;
         }
 
-        /* '\n' in the row before 17th char situation */
+        /* '\n' in the virtual row before 17th char. Fill the rest of the
+         * row with spaces and then move the cursor to the next row. */
         if (tmp[i] == '\n') {
             while (rel_virt_pos < DDRAM_ROW_LENGTH) {
                 ret = lcd1602a_putchar(priv, ' ');
@@ -589,10 +597,12 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
             }
 
             virt_pos++;
+            /* Move cursor to the next row */
             ret = lcd1602a_set_current_address(priv, *ppos + 1);
             if (ret)
                 goto write_err;
         } else {
+            /* Usual putchar case */
             ret = lcd1602a_putchar(priv, tmp[i]);
             if (ret)
                 goto write_err;
