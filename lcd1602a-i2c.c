@@ -90,7 +90,6 @@
 
 struct lcd1602a_data
 {
-//    unsigned char led_buf[LCD_BUF_SIZE];
     unsigned long state_flags;
     struct device *dev;
     struct i2c_client *client;
@@ -105,7 +104,7 @@ static void lcd1602a_error_recovery(struct lcd1602a_data *priv)
     if (test_bit(LCD_BACKLIGHT_FLAG, &priv->state_flags))
         byte |= K_PIN;
 
-    /* Yes, without any error-checks */
+    /* Yes, without any error-checks - we're in error situation already */
     i2c_smbus_write_byte(priv->client, byte);
 }
 
@@ -165,19 +164,6 @@ static int lcd1602a_rcv_byte_common(struct lcd1602a_data *priv, bool get_char)
     byte |= nibble & 0x0f;
     return byte;
 }
-
-#if 0
-static int lcd1602a_poll_busy(struct lcd1602a_data *priv)
-{
-    int ret = lcd1602a_rcv_byte_common(priv, 0);
-    if (ret < 0) {
-        dev_err(priv->dev, "Failed to poll LCD's BUSY bit! (code = %d)\n", ret);
-        return 0;
-    }
-
-    return (ret & LCD_IS_BUSY);
-}
-#endif
 
 static int lcd1602a_get_current_address(struct lcd1602a_data *priv)
 {
@@ -300,22 +286,6 @@ lcd_clear_err:
     dev_err(priv->dev, "Failed to clear LCD! (code = %d)\n", ret);
     return ret;
 }
-
-#if 0
-static int lcd1602a_return_cursor(struct lcd1602a_data *priv)
-{
-    int ret = lcd1602a_send_cmd(priv, CMD_RETURN_CURSOR);
-    if (ret)
-        goto lcd_return_err;
-
-    msleep(CLEAR_SLEEP_MS);
-    return ret;
-
-lcd_return_err:
-    dev_err(priv->dev, "Failed to return LCD's cursor! (code = %d)\n", ret);
-    return ret;
-}
-#endif
 
 static int lcd1602a_backlight_op(struct lcd1602a_data *priv, bool on)
 {
@@ -483,8 +453,8 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
 
     /* We are going to read by rows which have 17 chars. The 17th char is always '\n'. */
     int virt_row_size = DDRAM_ROW_LENGTH + 1;
-    loff_t output_pos = *ppos;
-    loff_t relative_pos = output_pos % virt_row_size;
+    loff_t virt_pos = *ppos;
+    loff_t rel_virt_pos = virt_pos % virt_row_size;
 
     if (!test_bit(LCD_POWERED_FLAG, &priv->state_flags))
         return -EIO;
@@ -498,8 +468,8 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
     if (!count || (*ppos >= 2 * virt_row_size))
         return 0;
 
-    if (count >= virt_row_size - relative_pos)
-        count = virt_row_size - relative_pos;
+    if (count >= virt_row_size - rel_virt_pos)
+        count = virt_row_size - rel_virt_pos;
 
     tmp = kzalloc(count * sizeof(*tmp), GFP_KERNEL);
     if (!tmp)
@@ -514,8 +484,8 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
 
     for (i = 0; i < count; i++) {
         /* Check 'new line' position */
-        if (relative_pos == DDRAM_ROW_LENGTH) {
-            lcd1602a_set_current_address(priv, output_pos + 1);
+        if (rel_virt_pos == DDRAM_ROW_LENGTH) {
+            lcd1602a_set_current_address(priv, virt_pos + 1);
             tmp[i] = '\n';
         } else {
             ret = lcd1602a_get_data_byte(priv);
@@ -524,8 +494,8 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
             tmp[i] = ret;
         }
 
-        output_pos++;
-        relative_pos = output_pos % virt_row_size;
+        virt_pos++;
+        rel_virt_pos = virt_pos % virt_row_size;
     }
 
     mutex_unlock(&priv->lock);
@@ -533,7 +503,7 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
     if (copy_to_user(buf, tmp, count)) {
         ret = -EFAULT;
     } else {
-        *ppos += output_pos;
+        *ppos = virt_pos;
         ret = count;
     }
 
@@ -556,8 +526,8 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
     /* We are going to write by rows which have 17 chars. The 17th char is always '\n'.
      * The received '\n' before 17th position will fill the rest of the row with spaces */
     int virt_row_size = DDRAM_ROW_LENGTH + 1;
-    loff_t output_pos = *ppos;
-    int relative_pos = output_pos % virt_row_size;
+    loff_t virt_pos = *ppos;
+    int rel_virt_pos = virt_pos % virt_row_size;
 
     if (!test_bit(LCD_POWERED_FLAG, &priv->state_flags))
         return -EIO;
@@ -594,11 +564,11 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
 
     for (i = 0; i < count; i++) {
         /* '\n' as 17th char in the row situation */
-        if (relative_pos == DDRAM_ROW_LENGTH) {
-            output_pos++;
+        if (rel_virt_pos == DDRAM_ROW_LENGTH) {
+            virt_pos++;
             if (tmp[i] == '\n')
                 continue;
-            relative_pos = output_pos % virt_row_size;
+            rel_virt_pos = virt_pos % virt_row_size;
 
             /* Move cursor to the next row */
             ret = lcd1602a_set_current_address(priv, *ppos + 1);
@@ -608,17 +578,17 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
 
         /* '\n' in the row before 17th char situation */
         if (tmp[i] == '\n') {
-            while (relative_pos < DDRAM_ROW_LENGTH) {
+            while (rel_virt_pos < DDRAM_ROW_LENGTH) {
                 ret = lcd1602a_putchar(priv, ' ');
                 if (ret)
                     goto write_err;
 
                 (*ppos)++;
-                output_pos++;
-                relative_pos = output_pos % virt_row_size;
+                virt_pos++;
+                rel_virt_pos = virt_pos % virt_row_size;
             }
 
-            output_pos++;
+            virt_pos++;
             ret = lcd1602a_set_current_address(priv, *ppos + 1);
             if (ret)
                 goto write_err;
@@ -628,9 +598,9 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
                 goto write_err;
 
             (*ppos)++;
-            output_pos++;
+            virt_pos++;
         }
-        relative_pos = output_pos % virt_row_size;
+        rel_virt_pos = virt_pos % virt_row_size;
     }
 
     ret = i;
@@ -656,7 +626,7 @@ static ssize_t lcd1602a_backlight_show(struct device *dev, struct device_attribu
     struct lcd1602a_data *priv = dev_get_drvdata(dev);
 
     mutex_lock(&priv->lock);
-    count = sprintf(buf, "%d\n", test_bit(LCD_BACKLIGHT_FLAG, &priv->state_flags));
+    count = sysfs_emit(buf, "%d\n", test_bit(LCD_BACKLIGHT_FLAG, &priv->state_flags));
     mutex_unlock(&priv->lock);
 
     return count;
@@ -664,12 +634,14 @@ static ssize_t lcd1602a_backlight_show(struct device *dev, struct device_attribu
 
 static ssize_t lcd1602a_backlight_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
-    int code = 0;
+    bool res;
     struct lcd1602a_data *priv = dev_get_drvdata(dev);
-    sscanf(buf, "%d", &code);
+
+    if (kstrtobool(buf, &res))
+        return -EFAULT;
 
     mutex_lock(&priv->lock);
-    lcd1602a_backlight_op(priv, code);
+    lcd1602a_backlight_op(priv, res);
     mutex_unlock(&priv->lock);
 
     return count;
