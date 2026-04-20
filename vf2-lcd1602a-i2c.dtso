@@ -1,0 +1,28 @@
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include "jh7110-pinfunc.h"
+
+&sysgpio {
+
+	lcd1602a_pins: lcd1602a-pins {
+		pinmux = <GPIOMUX(54, GPOUT_LOW, GPOEN_DISABLE, GPI_NONE)>;
+		bias-pull-up;
+		input-enable;
+	};
+};
+
+&i2c0 {
+	lcd1602a@27 {
+		compatible = "nkosyrev,lcd1602a-i2c";
+		reg = <0x27>;
+		pinctrl-0 = <&lcd1602a_pins>;
+		pinctrl-names = "default";
+		button-gpios = <&sysgpio 54 GPIO_ACTIVE_LOW>;
+		debounce-interval = <50>; // msec
+		interrupt-parent = <&sysgpio>;
+		interrupts = <54 IRQ_TYPE_EDGE_FALLING>;
+	};
+};
