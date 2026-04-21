@@ -10,6 +10,12 @@ DTS_INC = -I $(KDIR)/include \
           -I $(KDIR)/arch/$(ARCH)/boot/dts/starfive \
           -I $(KDIR)/scripts/dtc/include-prefixes
 
+TESTS_SRC_DIR = tests-src
+TESTS_BIN_DIR = tests-bin
+
+TESTS_SRCS = $(wildcard $(TESTS_SRC_DIR)/*.c)
+TESTS_BINS = $(patsubst $(TESTS_SRC_DIR)/%.c, $(TESTS_BIN_DIR)/%, $(TESTS_SRCS))
+
 module:
 	# module building
 	$(MAKE) -C $(KDIR) M=$(PWD) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules
@@ -21,9 +27,18 @@ dtbo:
 	dtc -@ -I dts -O dtb -o vf2-lcd1602a-i2c.dtbo vf2-lcd1602a-i2c.dtso.tmp
 	rm vf2-lcd1602a-i2c.dtso.tmp
 
-all: module
+$(TESTS_BIN_DIR):
+	mkdir -p $(TESTS_BIN_DIR)
+
+$(TESTS_BIN_DIR)/%: $(TESTS_SRC_DIR)/%.c
+	$(CROSS_COMPILE)gcc -Wall $< -o $@
+
+tests: $(TESTS_BIN_DIR) $(TESTS_BINS)
+
+all: module dtbo tests
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) ARCH=$(ARCH) clean
 	rm -f *.dtbo *.dtso.tmp
+	rm -rf $(TESTS_BIN_DIR)
 
