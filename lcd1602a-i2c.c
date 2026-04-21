@@ -467,7 +467,7 @@ lcd_isr_err:
 
 /***** File operation methods *****/
 
-static inline loff_t lcd1602_llseek(struct file *file, loff_t offset, int orig)
+static loff_t lcd1602_llseek(struct file *file, loff_t offset, int orig)
 {
     return fixed_size_llseek(file, offset, orig, 2 * (DDRAM_ROW_LENGTH + 1));
 }
@@ -780,7 +780,7 @@ static int lcd1602a_probe(struct i2c_client *client)
     struct lcd1602a_data *priv;
 
     if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_BYTE | I2C_FUNC_SMBUS_BYTE_DATA)) {
-        dev_err(&client->dev, "I2C_FUNC_SMBUS_BYTE is not supported by this adapter!\n");
+        dev_err(&client->dev, "Required functionality is not supported by I2C-adapter!\n");
         return -EIO;
     }
 
