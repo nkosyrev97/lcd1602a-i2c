@@ -16,6 +16,9 @@ TESTS_BIN_DIR = tests-bin
 TESTS_SRCS = $(wildcard $(TESTS_SRC_DIR)/*.c)
 TESTS_BINS = $(patsubst $(TESTS_SRC_DIR)/%.c, $(TESTS_BIN_DIR)/%, $(TESTS_SRCS))
 
+IP_ADDR = 10.42.0.34
+DEPLOY_PATH = /home/user/lcd1602a/
+
 module:
 	# module building
 	$(MAKE) -C $(KDIR) M=$(PWD) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules
@@ -42,3 +45,5 @@ clean:
 	rm -f *.dtbo *.dtso.tmp
 	rm -rf $(TESTS_BIN_DIR)
 
+deploy:
+	scp lcd1602a-i2c.ko vf2-lcd1602a-i2c.dtbo attach_dtbo.sh $(TESTS_BIN_DIR)/* user@$(IP_ADDR):$(DEPLOY_PATH)
