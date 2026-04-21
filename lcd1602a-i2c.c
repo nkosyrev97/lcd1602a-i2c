@@ -87,7 +87,6 @@
 
 #define LCD_MODULE_NAME                "lcd1602a-i2c"
 
-#define LCD_MAJOR                      55
 #define LCD_MINOR_BASE                 0
 #define LCD_MINOR_COUNT                1
 
@@ -107,6 +106,11 @@ struct lcd1602a_data
     int irq;
     struct gpio_desc *btn;
 };
+
+/* default to dynamic major allocation */
+static int major;
+module_param(major, int, 0);
+MODULE_PARM_DESC(major, "Major device number");
 
 static bool cursor_init;
 module_param (cursor_init, bool, S_IRUGO);
@@ -534,11 +538,6 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
     if (!test_bit(LCD_VISIBLE_FLAG, &priv->state_flags))
         return -EIO;
 
-    if (!access_ok(buf, count)) {
-        dev_err(priv->dev, "Error! Suspicious read access from user-space!\n");
-        return -EFAULT;
-    }
-
     /* Handle zero count or EOF */
     if (!count || (*ppos >= 2 * virt_row_size))
         return 0;
@@ -608,11 +607,6 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
 
     if (!test_bit(LCD_VISIBLE_FLAG, &priv->state_flags))
         return -EIO;
-
-    if (!access_ok(buf, count)) {
-        dev_err(priv->dev, "Error! Suspicious write access from user-space!\n");
-        return -EFAULT;
-    }
 
     /* Handle EOF and zero count */
     if (*ppos >= max_virt_size)
@@ -742,7 +736,7 @@ static struct file_operations lcd1602a_fops = {
     .compat_ioctl = compat_ptr_ioctl,
 };
 
-/***** sysfs file handling *****/
+/***** sysfs attribute-files handling *****/
 
 static ssize_t lcd1602a_backlight_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -776,46 +770,13 @@ static ssize_t lcd1602a_backlight_store(struct device *dev, struct device_attrib
 
 static DEVICE_ATTR(backlight, S_IWUSR | S_IRUGO, lcd1602a_backlight_show, lcd1602a_backlight_store);
 
-#if 0
-static ssize_t lcd1602a_cursor_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-    ssize_t count = 0;
-    struct lcd1602a_data *priv = dev_get_drvdata(dev);
-
-    mutex_lock(&priv->lock);
-    count = sysfs_emit(buf, "%d\n", test_bit(LCD_CURSOR_FLAG, &priv->state_flags));
-    mutex_unlock(&priv->lock);
-
-    return count;
-}
-
-static ssize_t lcd1602a_cursor_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-    bool res;
-    struct lcd1602a_data *priv = dev_get_drvdata(dev);
-
-    if (kstrtobool(buf, &res))
-        return -EFAULT;
-
-    mutex_lock(&priv->lock);
-    if (lcd1602a_cursor_op(priv, res)) {
-        mutex_unlock(&priv->lock);
-        return -EFAULT;
-    }
-
-    mutex_unlock(&priv->lock);
-    return count;
-}
-
-static DEVICE_ATTR(cursor, S_IWUSR | S_IRUGO, lcd1602a_cursor_show, lcd1602a_cursor_store);
-#endif
-
 /* "Linux Device Model" (I2C) section */
 
 static int lcd1602a_probe(struct i2c_client *client)
 {
     int ret;
     u32 debounce_ms;
+    dev_t devid;
     struct lcd1602a_data *priv;
 
     if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_BYTE | I2C_FUNC_SMBUS_BYTE_DATA)) {
@@ -859,7 +820,14 @@ static int lcd1602a_probe(struct i2c_client *client)
         return ret;
     }
 
-    ret = register_chrdev_region(MKDEV(LCD_MAJOR, LCD_MINOR_BASE), LCD_MINOR_COUNT, LCD_MODULE_NAME);
+    if (major) {
+        devid = MKDEV(major, LCD_MINOR_BASE);
+        ret = register_chrdev_region(devid, LCD_MINOR_COUNT, LCD_MODULE_NAME);
+    } else {
+        ret = alloc_chrdev_region(&devid, LCD_MINOR_BASE, LCD_MINOR_COUNT, LCD_MODULE_NAME);
+        major = MAJOR(devid);
+    }
+
     if (ret) {
         dev_err(priv->dev, "Error! Could register major:minor numbers!\n");
         return ret;
@@ -867,27 +835,26 @@ static int lcd1602a_probe(struct i2c_client *client)
 
     priv->cdev.owner = THIS_MODULE;
     cdev_init(&priv->cdev, &lcd1602a_fops);
-    ret = cdev_add(&priv->cdev, MKDEV(LCD_MAJOR, LCD_MINOR_BASE), LCD_MINOR_COUNT);
+    ret = cdev_add(&priv->cdev, devid, LCD_MINOR_COUNT);
     if (ret) {
         dev_err(priv->dev, "Error! Could register cdev object!\n");
         goto probe_err1;
     }
 
-//    device_create_file(priv->dev, &dev_attr_cursor);
     device_create_file(priv->dev, &dev_attr_backlight);
 
     ret = lcd1602a_init(priv);
     if (ret)
         goto probe_err2;
 
-    dev_info(priv->dev, "lcd1602a-i2c driver is probed!\n");
+    dev_info(priv->dev, "lcd1602a-i2c driver is probed! (major = %d)\n", major);
     return ret;
 
 probe_err2:
     device_remove_file(priv->dev, &dev_attr_backlight);
     cdev_del(&priv->cdev);
 probe_err1:
-    unregister_chrdev_region(MKDEV(LCD_MAJOR, LCD_MINOR_BASE), LCD_MINOR_COUNT);
+    unregister_chrdev_region(devid, LCD_MINOR_COUNT);
     return ret;
 }
 
@@ -898,10 +865,9 @@ static void lcd1602a_remove(struct i2c_client *client)
     lcd1602a_exit(priv);
 
     device_remove_file(priv->dev, &dev_attr_backlight);
-//    device_remove_file(priv->dev, &dev_attr_cursor);
 
     cdev_del(&priv->cdev);
-    unregister_chrdev_region(MKDEV(LCD_MAJOR, LCD_MINOR_BASE), LCD_MINOR_COUNT);
+    unregister_chrdev_region(MKDEV(major, LCD_MINOR_BASE), LCD_MINOR_COUNT);
 
     dev_info(priv->dev, "lcd1602a-i2c driver is removed!\n");
 }
