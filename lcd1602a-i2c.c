@@ -264,12 +264,8 @@ static int lcd1602a_set_current_address(struct lcd1602a_data *priv, unsigned int
 
     ret = lcd1602a_send_cmd(priv, cmd);
     if (ret)
-        goto lcd_set_addr_err;
+        dev_err(priv->dev, "Failed to set current address for LCD! (code = %d)\n", ret);
 
-    return ret;
-
-lcd_set_addr_err:
-    dev_err(priv->dev, "Failed to set current address for LCD! (code = %d)\n", ret);
     return ret;
 }
 
@@ -286,26 +282,20 @@ static int lcd1602a_putchar(struct lcd1602a_data *priv, u8 ch)
 {
     int ret = lcd1602a_send_data(priv, ch);
     if (ret)
-        goto lcd_putchar_err;
+        dev_err(priv->dev, "Failed to send data byte to LCD! (code = %d)\n", ret);
 
-    return ret;
-
-lcd_putchar_err:
-    dev_err(priv->dev, "Failed to send data byte to LCD! (code = %d)\n", ret);
     return ret;
 }
 
 static int lcd1602a_clear(struct lcd1602a_data *priv)
 {
     int ret = lcd1602a_send_cmd(priv, CMD_LCD_CLEAR);
-    if (ret)
-        goto lcd_clear_err;
+    if (ret) {
+        dev_err(priv->dev, "Failed to clear LCD! (code = %d)\n", ret);
+        return ret;
+    }
 
     msleep(CLEAR_SLEEP_MS);
-    return ret;
-
-lcd_clear_err:
-    dev_err(priv->dev, "Failed to clear LCD! (code = %d)\n", ret);
     return ret;
 }
 
@@ -315,18 +305,16 @@ static int lcd1602a_backlight_op(struct lcd1602a_data *priv, bool on)
     u8 byte = (on) ? BL_PIN : 0;
 
     ret = i2c_smbus_write_byte(priv->client, byte);
-    if (ret)
-       goto lcd_bl_err;
+    if (ret) {
+        dev_err(priv->dev, "Failed to change LCD's backlight! (code = %d)\n", ret);
+        return ret;
+    }
 
     if (on)
         set_bit(LCD_BACKLIGHT_FLAG, &priv->state_flags);
     else
         clear_bit(LCD_BACKLIGHT_FLAG, &priv->state_flags);
 
-    return ret;
-
-lcd_bl_err:
-    dev_err(priv->dev, "Failed to change LCD's backlight! (code = %d)\n", ret);
     return ret;
 }
 
@@ -833,8 +821,9 @@ static int lcd1602a_probe(struct i2c_client *client)
         return ret;
     }
 
-    priv->cdev.owner = THIS_MODULE;
     cdev_init(&priv->cdev, &lcd1602a_fops);
+    priv->cdev.owner = THIS_MODULE;
+    cdev_set_parent(&priv->cdev, &priv->dev->kobj);
     ret = cdev_add(&priv->cdev, devid, LCD_MINOR_COUNT);
     if (ret) {
         dev_err(priv->dev, "Error! Could register cdev object!\n");

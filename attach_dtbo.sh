@@ -11,7 +11,7 @@ mount -t configfs none /sys/kernel/config
 mkdir -p /sys/kernel/config/device-tree/overlays/lcd1602a
 cat /home/user/lcd1602a/vf2-lcd1602a-i2c.dtbo | tee /sys/kernel/config/device-tree/overlays/lcd1602a/dtbo > /dev/null
 
-STATUS=$(cat /sys/kernel/config/device-tree/overlays/my_overlay/status)
+STATUS=$(cat /sys/kernel/config/device-tree/overlays/lcd1602a/status)
 if [ "$STATUS" != "applied" ]; then
     echo "Error: Overlay not applied. Current status: $STATUS"
     rmdir /sys/kernel/config/device-tree/overlays/lcd1602a
