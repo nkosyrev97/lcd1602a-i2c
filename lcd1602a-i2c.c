@@ -670,6 +670,40 @@ static struct file_operations lcd1602a_fops = {
     .compat_ioctl = compat_ptr_ioctl,
 };
 
+/***** sysfs attribute-files handling *****/
+
+static ssize_t lcd1602a_backlight_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    ssize_t count = 0;
+    struct lcd1602a_data *priv = dev_get_drvdata(dev);
+
+    mutex_lock(&priv->lock);
+    count = sysfs_emit(buf, "%d\n", test_bit(LCD_BACKLIGHT_FLAG, &priv->state_flags));
+    mutex_unlock(&priv->lock);
+
+    return count;
+}
+
+static ssize_t lcd1602a_backlight_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    bool res;
+    struct lcd1602a_data *priv = dev_get_drvdata(dev);
+
+    if (kstrtobool(buf, &res))
+        return -EFAULT;
+
+    mutex_lock(&priv->lock);
+    if (lcd1602a_backlight_op(priv, res)) {
+        mutex_unlock(&priv->lock);
+        return -EFAULT;
+    }
+
+    mutex_unlock(&priv->lock);
+    return count;
+}
+
+static DEVICE_ATTR(backlight, S_IWUSR | S_IRUGO, lcd1602a_backlight_show, lcd1602a_backlight_store);
+
 /* "Linux Device Model" (I2C) section */
 
 static int lcd1602a_probe(struct i2c_client *client)
@@ -718,6 +752,8 @@ static int lcd1602a_probe(struct i2c_client *client)
         goto probe_err1;
     }
 
+    device_create_file(priv->dev, &dev_attr_backlight);
+
     ret = lcd1602a_init(priv);
     if (ret)
         goto probe_err2;
@@ -726,6 +762,7 @@ static int lcd1602a_probe(struct i2c_client *client)
     return ret;
 
 probe_err2:
+    device_remove_file(priv->dev, &dev_attr_backlight);
     cdev_del(&priv->cdev);
 probe_err1:
     unregister_chrdev_region(devid, LCD_MINOR_COUNT);
@@ -737,6 +774,8 @@ static void lcd1602a_remove(struct i2c_client *client)
     struct lcd1602a_data *priv = dev_get_drvdata(&client->dev);
 
     lcd1602a_exit(priv);
+
+    device_remove_file(priv->dev, &dev_attr_backlight);
 
     cdev_del(&priv->cdev);
     unregister_chrdev_region(MKDEV(major, LCD_MINOR_BASE), LCD_MINOR_COUNT);
