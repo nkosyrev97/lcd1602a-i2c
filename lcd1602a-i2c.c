@@ -9,6 +9,8 @@
 #include <linux/cdev.h>
 #include <linux/uaccess.h>
 
+#include "lcd1602a-i2c-ioctls.h"
+
 /***** PCF8574 to LCD1602A pin-mapping *****/
 
 #define RS_PIN                         BIT(0) /* 0 = CMD, 1 = DATA */
@@ -618,6 +620,45 @@ write_err:
     return ret;
 }
 
+static long lcd1602a_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    long ret = -EFAULT;
+    unsigned int res = 0;
+    struct lcd1602a_data *priv = filp->private_data;
+
+    mutex_lock(&priv->lock);
+
+    switch (cmd) {
+    case LCD_IOC_CURSOR_GET:
+        if (test_bit(LCD_CURSOR_FLAG, &priv->state_flags))
+            res = 1;
+        if (put_user(res, (unsigned int __user *)arg))
+            goto ioctl_err;
+        ret = 0;
+        break;
+
+    case LCD_IOC_CURSOR_SET:
+        if (get_user(res, (unsigned int __user *)arg))
+            goto ioctl_err;
+        if (res > 1) {
+            ret = -EINVAL;
+            goto ioctl_err;
+        }
+
+        ret = lcd1602a_cursor_op(priv, (bool) res);
+        if (ret)
+            goto ioctl_err;
+        break;
+
+    default:
+        ret = -ENOTTY;
+    }
+
+ioctl_err:
+    mutex_unlock(&priv->lock);
+    return ret;
+}
+
 static struct file_operations lcd1602a_fops = {
     .owner = THIS_MODULE,
     .llseek = lcd1602_llseek,
@@ -625,6 +666,8 @@ static struct file_operations lcd1602a_fops = {
     .release = lcd1602a_release,
     .read = lcd1602a_read,
     .write = lcd1602a_write,
+    .unlocked_ioctl = lcd1602a_ioctl,
+    .compat_ioctl = compat_ptr_ioctl,
 };
 
 /* "Linux Device Model" (I2C) section */
