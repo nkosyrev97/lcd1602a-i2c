@@ -5,6 +5,9 @@
 #include <linux/mutex.h>
 #include <linux/delay.h>
 #include <linux/string.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/uaccess.h>
 
 /***** PCF8574 to LCD1602A pin-mapping *****/
 
@@ -79,8 +82,12 @@
 
 #define LCD_MODULE_NAME                "lcd1602a-i2c"
 
+#define LCD_MINOR_BASE                 0
+#define LCD_MINOR_COUNT                1
+
 #define LCD_BACKLIGHT_FLAG             0
 #define LCD_CURSOR_FLAG                1
+#define LCD_OPENED_FLAG                2
 
 struct lcd1602a_data
 {
@@ -88,7 +95,13 @@ struct lcd1602a_data
     struct i2c_client *client;
     struct mutex lock;
     unsigned long state_flags;
+    struct cdev cdev;
 };
+
+/* default to dynamic major allocation */
+static int major;
+module_param(major, int, 0);
+MODULE_PARM_DESC(major, "Major device number");
 
 static bool cursor_init;
 module_param (cursor_init, bool, S_IRUGO);
@@ -225,6 +238,26 @@ static int lcd1602a_get_current_address(struct lcd1602a_data *priv)
     }
 
     return (ret & LCD_CURRENT_ADDR);
+}
+
+static int lcd1602a_set_current_address(struct lcd1602a_data *priv, unsigned int pos)
+{
+    int ret;
+    u8 cmd = 0;
+
+    if (pos <= DDRAM_ROW_LENGTH) {
+        cmd |= CMD_SET_POS_1ROW_BASE + pos;
+    } else if ((pos > DDRAM_ROW_LENGTH) && (pos <= 2 * DDRAM_ROW_LENGTH + 1)) {
+        cmd |= CMD_SET_POS_2ROW_BASE + (pos - DDRAM_ROW_LENGTH - 1);
+    } else {
+        ret = -ENOSPC;
+    }
+
+    ret = lcd1602a_send_cmd(priv, cmd);
+    if (ret)
+        dev_err(priv->dev, "Failed to set current address for LCD! (code = %d)\n", ret);
+
+    return ret;
 }
 
 static int lcd1602a_getchar(struct lcd1602a_data *priv)
@@ -373,11 +406,233 @@ lcd_exit_err:
     return ret;
 }
 
+/***** File operation methods *****/
+
+static loff_t lcd1602_llseek(struct file *file, loff_t offset, int orig)
+{
+    return fixed_size_llseek(file, offset, orig, 2 * (DDRAM_ROW_LENGTH + 1));
+}
+
+static int lcd1602a_open(struct inode *inode, struct file *filp)
+{
+    int ret = -EFAULT;
+    struct lcd1602a_data *priv = container_of(inode->i_cdev, struct lcd1602a_data, cdev);
+
+    if (test_and_set_bit(LCD_OPENED_FLAG, &priv->state_flags))
+        return -EBUSY;
+
+    filp->private_data = priv;
+    filp->f_pos = 0;
+
+    mutex_lock(&priv->lock);
+
+    if (filp->f_flags & O_TRUNC) {
+        ret = lcd1602a_clear(priv);
+        if (ret)
+            goto open_err;
+    }
+
+    if (filp->f_flags & O_APPEND) {
+        ret = lcd1602a_get_current_address(priv);
+        if (ret < 0)
+            goto open_err;
+
+        if (ret >= DDRAM_1ROW_OFFSET &&
+            ret <= DDRAM_1ROW_OFFSET + DDRAM_ROW_LENGTH)
+            filp->f_pos = ret - DDRAM_1ROW_OFFSET;
+        else if (ret >= DDRAM_2ROW_OFFSET &&
+                 ret <= DDRAM_2ROW_OFFSET + DDRAM_ROW_LENGTH)
+            filp->f_pos = (ret - DDRAM_2ROW_OFFSET) + DDRAM_ROW_LENGTH + 1;
+        else
+            filp->f_pos = 2 * DDRAM_ROW_LENGTH + 2;
+    }
+
+    ret = 0;
+
+open_err:
+    mutex_unlock(&priv->lock);
+    return ret;
+}
+
+static int lcd1602a_release(struct inode *inode, struct file *filp)
+{
+    struct lcd1602a_data *priv = filp->private_data;
+    clear_bit(LCD_OPENED_FLAG, &priv->state_flags);
+    return 0;
+}
+
+static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, loff_t *ppos)
+{
+    int i = 0;
+    ssize_t ret = -EFAULT;
+    unsigned char *tmp = NULL;
+    struct lcd1602a_data *priv = filp->private_data;
+
+    /* We are going to read by rows which have 17 chars. The 17th char is always '\n'. */
+    int virt_row_size = DDRAM_ROW_LENGTH + 1;
+    loff_t virt_pos = *ppos;
+    loff_t rel_virt_pos = virt_pos % virt_row_size;
+
+    /* Handle zero count or EOF */
+    if (!count || (*ppos >= 2 * virt_row_size))
+        return 0;
+
+    if (count > virt_row_size - rel_virt_pos)
+        count = virt_row_size - rel_virt_pos;
+
+    tmp = kzalloc(count * sizeof(*tmp), GFP_KERNEL);
+    if (!tmp)
+        return -ENOMEM;
+
+    mutex_lock(&priv->lock);
+
+    /* Sync cursor and file position */
+    ret = lcd1602a_set_current_address(priv, *ppos);
+    if (ret)
+        goto read_err;
+
+    for (i = 0; i < count; i++) {
+
+        /* Check 'new line' position */
+        if (rel_virt_pos == DDRAM_ROW_LENGTH) {
+            lcd1602a_set_current_address(priv, virt_pos + 1);
+            tmp[i] = '\n';
+        } else {
+            ret = lcd1602a_getchar(priv);
+            if (ret < 0)
+                goto read_err;
+            tmp[i] = ret;
+        }
+
+        virt_pos++;
+        rel_virt_pos = virt_pos % virt_row_size;
+    }
+
+    mutex_unlock(&priv->lock);
+
+    if (copy_to_user(buf, tmp, count)) {
+        ret = -EFAULT;
+    } else {
+        *ppos = virt_pos;
+        ret = count;
+    }
+
+    kfree(tmp);
+    return ret;
+
+read_err:
+    mutex_unlock(&priv->lock);
+    kfree(tmp);
+    return ret;
+}
+
+static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t count, loff_t *ppos)
+{
+    int i = 0;
+    ssize_t ret = -EFAULT;
+    unsigned char *tmp = NULL;
+    struct lcd1602a_data *priv = filp->private_data;
+
+    /* We are going to write by rows which have 17 chars. The 17th char is always '\n'. */
+    int virt_row_size = DDRAM_ROW_LENGTH + 1;
+    /* 2 phys rows by 16 chars and 1 virtual '\n' between them */
+    int max_virt_size = 2 * virt_row_size - 1;
+    loff_t virt_pos = *ppos;
+    int rel_virt_pos = virt_pos % virt_row_size;
+
+    /* Handle EOF and zero count */
+    if (*ppos >= max_virt_size)
+        return -ENOSPC;
+    if (!count)
+        return 0;
+
+    if (count > max_virt_size - *ppos)
+        count = max_virt_size - *ppos;
+
+    tmp = kzalloc(count * sizeof(*tmp), GFP_KERNEL);
+    if (!tmp)
+        return -ENOMEM;
+
+    if (copy_from_user(tmp, buf, count)) {
+        kfree(tmp);
+        return -EFAULT;
+    }
+
+    mutex_lock(&priv->lock);
+
+    /* Sync cursor and file position */
+    ret = lcd1602a_set_current_address(priv, *ppos);
+    if (ret)
+        goto write_err;
+
+    for (i = 0; i < count; i++) {
+
+        /* '\n' as 17th char in the virtual row */
+        if (rel_virt_pos == DDRAM_ROW_LENGTH) {
+            virt_pos++;
+            if (tmp[i] == '\n')
+                continue;
+            rel_virt_pos = virt_pos % virt_row_size;
+
+            /* Move cursor to the next row */
+            ret = lcd1602a_set_current_address(priv, *ppos + 1);
+            if (ret)
+                goto write_err;
+        }
+
+        /* '\n' in the virtual row before 17th char. Fill the rest of the
+         * row with spaces and then move the cursor to the next row. */
+        if (tmp[i] == '\n') {
+            while (rel_virt_pos < DDRAM_ROW_LENGTH) {
+                ret = lcd1602a_putchar(priv, ' ');
+                if (ret)
+                    goto write_err;
+
+                (*ppos)++;
+                virt_pos++;
+                rel_virt_pos = virt_pos % virt_row_size;
+            }
+
+            virt_pos++;
+            /* Move cursor to the next row */
+            ret = lcd1602a_set_current_address(priv, *ppos + 1);
+            if (ret)
+                goto write_err;
+        } else {
+            /* Usual putchar case */
+            ret = lcd1602a_putchar(priv, tmp[i]);
+            if (ret)
+                goto write_err;
+
+            (*ppos)++;
+            virt_pos++;
+        }
+        rel_virt_pos = virt_pos % virt_row_size;
+    }
+
+    ret = i;
+
+write_err:
+    kfree(tmp);
+    mutex_unlock(&priv->lock);
+    return ret;
+}
+
+static struct file_operations lcd1602a_fops = {
+    .owner = THIS_MODULE,
+    .llseek = lcd1602_llseek,
+    .open = lcd1602a_open,
+    .release = lcd1602a_release,
+    .read = lcd1602a_read,
+    .write = lcd1602a_write,
+};
+
 /* "Linux Device Model" (I2C) section */
 
 static int lcd1602a_probe(struct i2c_client *client)
 {
     int ret;
+    dev_t devid;
     struct lcd1602a_data *priv;
 
     if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_BYTE | I2C_FUNC_SMBUS_BYTE_DATA)) {
@@ -398,11 +653,39 @@ static int lcd1602a_probe(struct i2c_client *client)
 
     mutex_init(&priv->lock);
 
+    if (major) {
+        devid = MKDEV(major, LCD_MINOR_BASE);
+        ret = register_chrdev_region(devid, LCD_MINOR_COUNT, LCD_MODULE_NAME);
+    } else {
+        ret = alloc_chrdev_region(&devid, LCD_MINOR_BASE, LCD_MINOR_COUNT, LCD_MODULE_NAME);
+        major = MAJOR(devid);
+    }
+
+    if (ret) {
+        dev_err(priv->dev, "Error! Could register major:minor numbers!\n");
+        return ret;
+    }
+
+    cdev_init(&priv->cdev, &lcd1602a_fops);
+    priv->cdev.owner = THIS_MODULE;
+    cdev_set_parent(&priv->cdev, &priv->dev->kobj);
+    ret = cdev_add(&priv->cdev, devid, LCD_MINOR_COUNT);
+    if (ret) {
+        dev_err(priv->dev, "Error! Could register cdev object!\n");
+        goto probe_err1;
+    }
+
     ret = lcd1602a_init(priv);
     if (ret)
-        return ret;
+        goto probe_err2;
 
-    dev_info(priv->dev, "lcd1602a-i2c driver is probed!\n");
+    dev_info(priv->dev, "lcd1602a-i2c driver is probed! (major = %d)\n", major);
+    return ret;
+
+probe_err2:
+    cdev_del(&priv->cdev);
+probe_err1:
+    unregister_chrdev_region(devid, LCD_MINOR_COUNT);
     return ret;
 }
 
@@ -411,6 +694,9 @@ static void lcd1602a_remove(struct i2c_client *client)
     struct lcd1602a_data *priv = dev_get_drvdata(&client->dev);
 
     lcd1602a_exit(priv);
+
+    cdev_del(&priv->cdev);
+    unregister_chrdev_region(MKDEV(major, LCD_MINOR_BASE), LCD_MINOR_COUNT);
 
     dev_info(priv->dev, "lcd1602a-i2c driver is removed!\n");
 }
