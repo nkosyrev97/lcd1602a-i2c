@@ -8,6 +8,9 @@
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/uaccess.h>
+#include <linux/of.h>
+#include <linux/interrupt.h>
+#include <linux/gpio/consumer.h>
 
 #include "lcd1602a-i2c-ioctls.h"
 
@@ -90,6 +93,8 @@
 #define LCD_BACKLIGHT_FLAG             0
 #define LCD_CURSOR_FLAG                1
 #define LCD_OPENED_FLAG                2
+#define LCD_VISIBLE_FLAG               3
+#define LCD_NO_DEBOUNCE_FLAG           4
 
 struct lcd1602a_data
 {
@@ -98,6 +103,8 @@ struct lcd1602a_data
     struct mutex lock;
     unsigned long state_flags;
     struct cdev cdev;
+    int irq;
+    struct gpio_desc *btn;
 };
 
 /* default to dynamic major allocation */
@@ -378,6 +385,8 @@ static int lcd1602a_init(struct lcd1602a_data *priv)
     if (ret)
         goto lcd_init_err;
 
+    set_bit(LCD_VISIBLE_FLAG, &priv->state_flags);
+
     return ret;
 
 lcd_init_err:
@@ -408,6 +417,42 @@ lcd_exit_err:
     return ret;
 }
 
+/***** IRQ handling *****/
+
+static irqreturn_t lcd1602a_threaded_isr(int irq, void *dev_id)
+{
+    int ret = -EFAULT;
+    struct lcd1602a_data *priv = dev_id;
+
+    /* Check if debounce sleeping is needed */
+    if (test_bit(LCD_NO_DEBOUNCE_FLAG, &priv->state_flags))
+        msleep(50);
+
+    mutex_lock(&priv->lock);
+
+    if (test_bit(LCD_VISIBLE_FLAG, &priv->state_flags)) {
+        ret = lcd1602a_send_cmd(priv, CMD_LCD_DISPLAY_OFF);
+        if (ret)
+            goto lcd_isr_err;
+        clear_bit(LCD_VISIBLE_FLAG, &priv->state_flags);
+    } else {
+        if (test_bit(LCD_CURSOR_FLAG, &priv->state_flags)) {
+            ret = lcd1602a_send_cmd(priv, CMD_LCD_DISPLAY_CURSOR);
+            if (ret)
+                goto lcd_isr_err;
+        } else {
+            ret = lcd1602a_send_cmd(priv, CMD_LCD_DISPLAY_PLAIN);
+            if (ret)
+                goto lcd_isr_err;
+        }
+        set_bit(LCD_VISIBLE_FLAG, &priv->state_flags);
+    }
+
+lcd_isr_err:
+    mutex_unlock(&priv->lock);
+    return IRQ_HANDLED;
+}
+
 /***** File operation methods *****/
 
 static loff_t lcd1602_llseek(struct file *file, loff_t offset, int orig)
@@ -419,6 +464,9 @@ static int lcd1602a_open(struct inode *inode, struct file *filp)
 {
     int ret = -EFAULT;
     struct lcd1602a_data *priv = container_of(inode->i_cdev, struct lcd1602a_data, cdev);
+
+    if (!test_bit(LCD_VISIBLE_FLAG, &priv->state_flags))
+        return -EIO;
 
     if (test_and_set_bit(LCD_OPENED_FLAG, &priv->state_flags))
         return -EBUSY;
@@ -474,6 +522,9 @@ static ssize_t lcd1602a_read(struct file *filp, char __user *buf, size_t count, 
     int virt_row_size = DDRAM_ROW_LENGTH + 1;
     loff_t virt_pos = *ppos;
     loff_t rel_virt_pos = virt_pos % virt_row_size;
+
+    if (!test_bit(LCD_VISIBLE_FLAG, &priv->state_flags))
+        return -EIO;
 
     /* Handle zero count or EOF */
     if (!count || (*ppos >= 2 * virt_row_size))
@@ -541,6 +592,9 @@ static ssize_t lcd1602a_write(struct file *filp, const char __user *buf, size_t 
     int max_virt_size = 2 * virt_row_size - 1;
     loff_t virt_pos = *ppos;
     int rel_virt_pos = virt_pos % virt_row_size;
+
+    if (!test_bit(LCD_VISIBLE_FLAG, &priv->state_flags))
+        return -EIO;
 
     /* Handle EOF and zero count */
     if (*ppos >= max_virt_size)
@@ -710,6 +764,7 @@ static int lcd1602a_probe(struct i2c_client *client)
 {
     int ret;
     dev_t devid;
+    u32 debounce_ms;
     struct lcd1602a_data *priv;
 
     if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_BYTE | I2C_FUNC_SMBUS_BYTE_DATA)) {
@@ -729,6 +784,29 @@ static int lcd1602a_probe(struct i2c_client *client)
     dev_set_drvdata(priv->dev, priv);
 
     mutex_init(&priv->lock);
+
+    priv->btn = devm_gpiod_get(priv->dev, "button", GPIOD_IN);
+    if (IS_ERR(priv->btn))
+        return PTR_ERR(priv->btn);
+
+    if (!device_property_read_u32(priv->dev, "debounce-interval", &debounce_ms)) {
+        ret = gpiod_set_debounce(priv->btn, debounce_ms * 1000);
+        if (ret) {
+            dev_warn(priv->dev, "Warning! Could not set debounce! (code = %d)\n", ret);
+            set_bit(LCD_NO_DEBOUNCE_FLAG, &priv->state_flags);
+        }
+    }
+
+    priv->irq = gpiod_to_irq(priv->btn);
+    if (priv->irq < 0)
+        return priv->irq;
+
+    ret = devm_request_threaded_irq(priv->dev, priv->irq, NULL, lcd1602a_threaded_isr,
+                                    IRQF_ONESHOT | IRQF_TRIGGER_FALLING, LCD_MODULE_NAME, priv);
+    if (ret) {
+        dev_err(priv->dev, "Error! Could request IRQ handler! (code = %d)\n", ret);
+        return ret;
+    }
 
     if (major) {
         devid = MKDEV(major, LCD_MINOR_BASE);
