@@ -116,6 +116,10 @@ static bool cursor_init;
 module_param (cursor_init, bool, S_IRUGO);
 MODULE_PARM_DESC (cursor_init, "Enable blink cursor during initialization");
 
+static bool irq_panic;
+module_param (irq_panic, bool, (S_IRUGO | S_IWUSR | S_IWGRP));
+MODULE_PARM_DESC (irq_panic, "Enable sleep in HardIRQ handler (for educational purpose)");
+
 /***** Low-level I/O methods *****/
 
 static void lcd1602a_error_recovery(struct lcd1602a_data *priv)
@@ -418,6 +422,15 @@ lcd_exit_err:
 }
 
 /***** IRQ handling *****/
+
+static irqreturn_t lcd1602a_hard_isr(int irq, void *dev_id)
+{
+    /* This will cause kernel panic (for educational purposes) */
+    if (irq_panic)
+        msleep(5);
+
+    return IRQ_WAKE_THREAD;
+}
 
 static irqreturn_t lcd1602a_threaded_isr(int irq, void *dev_id)
 {
@@ -801,7 +814,7 @@ static int lcd1602a_probe(struct i2c_client *client)
     if (priv->irq < 0)
         return priv->irq;
 
-    ret = devm_request_threaded_irq(priv->dev, priv->irq, NULL, lcd1602a_threaded_isr,
+    ret = devm_request_threaded_irq(priv->dev, priv->irq, lcd1602a_hard_isr, lcd1602a_threaded_isr,
                                     IRQF_ONESHOT | IRQF_TRIGGER_FALLING, LCD_MODULE_NAME, priv);
     if (ret) {
         dev_err(priv->dev, "Error! Could request IRQ handler! (code = %d)\n", ret);
